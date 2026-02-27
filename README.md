@@ -23,9 +23,9 @@ Automated screening and data extraction for a systematic review of gut microbiom
                                │
                                ▼
 ┌──────────────────────────────────────────────────────────────┐
-│  STAGE 2: Human / Full-Text Review  (your undergrad team)    │
+│  STAGE 2: Human / Full-Text Review                           │
 │                                                              │
-│  review_queue.csv has two types of entries:                   │
+│  review_queue.csv has two types of entries:                  │
 │                                                              │
 │  "screening"       → Claude couldn't decide include/exclude  │
 │                      Reviewer gets the PDF, makes the call   │
