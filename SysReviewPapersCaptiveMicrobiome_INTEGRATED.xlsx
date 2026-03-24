@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+#!/usr/bin/env python3
+"""
+STAGE 1 RERUN PIPELINE
+========================
+Reruns errored papers and enriched NFT papers through the screening agent.
+
+This script:
+  1. Loads the original agent results (errors + NFT)
+  2. Loads enriched abstracts from enrich_abstracts.py output
+  3. Merges enriched abstracts into paper metadata
+  4. Sends papers through Claude screening with the same system prompt
+  5. Outputs new results in the same JSON format for integration
+
+Usage:
+  python rerun_pipeline.py --dry-run                    # report what would be rerun
+  python rerun_pipeline.py                               # rerun all eligible
+  python rerun_pipeline.py --limit 10                    # test with 10 papers
+  python rerun_pipeline.py --errors-only                 # only rerun API errors
+  python rerun_pipeline.py --model claude-sonnet-4-6     # specify model
+  python rerun_pipeline.py --batch                       # use Batch API (recommended)
+
+Requires: anthropic, pyzotero
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ── CONFIG ──
+ORIGINAL_JSON = Path("todo_20260227_112439_raw.json")
+ENRICHED_JSON = Path("enriched_abstracts.json")
+OUTPUT_DIR = Path("outputs/rerun")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+ZOTERO_API_KEY = os.environ.get("ZOTERO_API_KEY")
+ZOTERO_LIBRARY_ID = os.environ.get("ZOTERO_LIBRARY_ID")
+
+DEFAULT_MODEL = "claude-sonnet-4-6"
+MAX_TOKENS = 4000
+MAX_RETRIES = 3
+RETRY_BASE_SEC = 2
+PAUSE_BETWEEN = 0.6
+
+
+# ── SYSTEM PROMPT (same as original pipeline) ──
+# Import from extract_pipeline.py or paste here
+SYSTEM_PROMPT_PATH = Path("extract_pipeline.py")
+
+
+def load_system_prompt():
+    """Extract system prompt from extract_pipeline.py."""
+    # Search in script directory, current directory, then parent
+    script_dir = Path(__file__).resolve().parent
+    candidates = [
+        SYSTEM_PROMPT_PATH,
+        script_dir / "extract_pipeline.py",
+        Path.cwd() / "extract_pipeline.py",
+    ]
+    content = None
+    for candidate in candidates:
+        if candidate.exists():
+            content = candidate.read_text()
+            break
+    if content is None:
+        print("ERROR: Cannot find extract_pipeline.py for system prompt")
+        print(f"  Searched: {[str(c) for c in candidates]}")
+        sys.exit(1)
+
+    # Extract between triple quotes
+    start = content.find('SYSTEM_PROMPT = """') + len('SYSTEM_PROMPT = """')
+    end = content.find('"""', start)
+    return content[start:end]
+
+
+def build_user_message(title, abstract, authors="", year="", journal="", doi=""):
+    """Construct the per-paper message."""
+    if not abstract or abstract.strip() == "":
+        abstract = (
+            "[No abstract available. Screen based on title and metadata only. "
+            "If you cannot confidently determine inclusion or exclusion, "
+            'use screening_decision: "needs_full_text".]'
+        )
+
+    return (
+        f"Please screen and extract data from this paper:\n\n"
+        f"TITLE: {title}\n"
+        f"AUTHORS: {authors}\n"
+        f"YEAR: {year}\n"
+        f"JOURNAL: {journal}\n"
+        f"DOI: {doi}\n\n"
+        f"ABSTRACT:\n{abstract}"
+    )
+
+
+def call_claude(client, user_message, paper_key, model):
+    """Send one paper to Claude. Returns parsed JSON."""
+    import anthropic
+
+    system_prompt = load_system_prompt()
+    last_error = None
+    raw_text = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = client.messages.create(
+                model=model,
+                max_tokens=MAX_TOKENS,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_message}],
+            )
+            raw_text = response.content[0].text.strip()
+
+            if raw_text.startswith("```"):
+                lines = raw_text.split("\n")
+                if lines[0].startswith("```"):
+                    lines = lines[1:]
+                if lines and lines[-1].strip() == "```":
+                    lines = lines[:-1]
+                raw_text = "\n".join(lines)
+
+            result = json.loads(raw_text)
+            result["zotero_key"] = paper_key
+            result["rerun"] = True
+            return result
+
+        except json.JSONDecodeError as e:
+            last_error = f"json_parse_error: {e}"
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_BASE_SEC ** attempt)
+        except anthropic.RateLimitError:
+            wait = RETRY_BASE_SEC ** attempt * 5
+            time.sleep(wait)
+            last_error = "rate_limit"
+        except anthropic.APIStatusError as e:
+            last_error = f"api_{e.status_code}: {e.message}"
+            if e.status_code >= 500 and attempt < MAX_RETRIES:
+                time.sleep(RETRY_BASE_SEC ** attempt)
+            else:
+                break
+        except Exception as e:
+            last_error = str(e)
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_BASE_SEC ** attempt)
+
+    return {"zotero_key": paper_key, "error": last_error, "raw_response": raw_text, "rerun": True}
+
+
+def prepare_batch_requests(papers, model):
+    """Prepare Batch API request file (JSONL)."""
+    system_prompt = load_system_prompt()
+    requests = []
+    for paper in papers:
+        msg = build_user_message(
+            title=paper.get("title", ""),
+            abstract=paper.get("abstract", ""),
+            authors=paper.get("authors", ""),
+            year=paper.get("year", ""),
+            journal=paper.get("journal", ""),
+            doi=paper.get("doi", ""),
+        )
+        requests.append({
+            "custom_id": paper["zotero_key"],
+            "params": {
+                "model": model,
+                "max_tokens": MAX_TOKENS,
+                "system": system_prompt,
+                "messages": [{"role": "user", "content": msg}],
+            }
+        })
+    return requests
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Rerun errored/NFT papers through Stage 1")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--errors-only", action="store_true")
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--model", type=str, default=DEFAULT_MODEL)
+    parser.add_argument("--batch", action="store_true", help="Generate Batch API JSONL file")
+    parser.add_argument("--resume", action="store_true", help="Resume from last checkpoint")
+    parser.add_argument("--original-json", type=str, default=str(ORIGINAL_JSON))
+    parser.add_argument("--enriched-json", type=str, default=str(ENRICHED_JSON))
+    parser.add_argument("--excel", type=str, default=None,
+                        help="Path to master Excel workbook (auto-detected if not set)")
+    args = parser.parse_args()
+
+    script_dir = Path(__file__).resolve().parent
+
+    # Load original results — search script dir if not found at given path
+    orig_path = Path(args.original_json)
+    if not orig_path.exists():
+        orig_path = script_dir / Path(args.original_json).name
+    if not orig_path.exists():
+        print(f"ERROR: Cannot find original JSON at {args.original_json}")
+        print(f"  Also tried: {script_dir / Path(args.original_json).name}")
+        sys.exit(1)
+    with open(orig_path) as f:
+        original = json.load(f)
+
+    # Separate errors and NFTs
+    errors = [r for r in original if "error" in r]
+    nfts = [r for r in original if r.get("screening_decision") == "needs_full_text"]
+
+    # Load enriched abstracts (if available)
+    enriched_path = Path(args.enriched_json)
+    if not enriched_path.exists():
+        enriched_path = script_dir / Path(args.enriched_json).name
+    enriched_lookup = {}
+    if enriched_path.exists():
+        with open(enriched_path) as f:
+            enriched = json.load(f)
+        for rec in enriched:
+            if rec.get("abstract"):
+                enriched_lookup[rec["zotero_key"]] = rec["abstract"]
+        print(f"Loaded {len(enriched_lookup)} enriched abstracts")
+    else:
+        print(f"No enriched abstracts file found at {enriched_path}")
+        print("  Run enrich_abstracts.py first for best results")
+
+    # Load Zotero metadata from Assignments sheet for title/author/year
+    import openpyxl
+    if args.excel:
+        excel_path = Path(args.excel)
+    else:
+        # Auto-detect: look in script directory and common locations
+        candidates = [
+            script_dir / "SysReviewPapersCaptiveMicrobiome_1.xlsx",
+            script_dir / "SysReviewPapersCaptiveMicrobiome_INTEGRATED.xlsx",
+            Path.cwd() / "SysReviewPapersCaptiveMicrobiome_1.xlsx",
+        ]
+        excel_path = None
+        for c in candidates:
+            if c.exists():
+                excel_path = c
+                break
+        if excel_path is None:
+            print("ERROR: Cannot find master Excel workbook.")
+            print(f"  Searched: {[str(c) for c in candidates]}")
+            print("  Use --excel /path/to/SysReviewPapersCaptiveMicrobiome_1.xlsx")
+            sys.exit(1)
+    print(f"Using Excel: {excel_path}")
+    wb = openpyxl.load_workbook(excel_path, read_only=True)
+    ws = wb["Assignments"]
+    headers = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+    idx = {h: i for i, h in enumerate(headers)}
+    assignments = {}
+    for row in ws.iter_rows(min_row=2):
+        vals = [c.value for c in row]
+        key = vals[idx["Key"]]
+        if key:
+            assignments[key] = {
+                "title": vals[idx.get("Title", 0)] or "",
+                "authors": vals[idx.get("Author", 0)] or "",
+                "year": str(vals[idx.get("Publication Year", 0)] or "")[:4],
+                "journal": vals[idx.get("Journal", 0)] or "",
+                "doi": vals[idx.get("DOI", 0)] or "",
+                "abstract": vals[idx.get("Abstract Note", 0)] or "",
+            }
+    wb.close()
+
+    # Build rerun list
+    rerun_papers = []
+
+    for rec in errors:
+        zk = rec.get("zotero_key", "")
+        meta = assignments.get(zk, {})
+        abstract = enriched_lookup.get(zk, meta.get("abstract", ""))
+        rerun_papers.append({
+            "zotero_key": zk,
+            "doi": rec.get("doi", meta.get("doi", "")),
+            "title": meta.get("title", ""),
+            "authors": meta.get("authors", ""),
+            "year": meta.get("year", ""),
+            "journal": meta.get("journal", ""),
+            "abstract": abstract,
+            "original_status": "error",
+        })
+
+    if not args.errors_only:
+        for rec in nfts:
+            zk = rec.get("zotero_key", "")
+            meta = assignments.get(zk, {})
+            enriched_abs = enriched_lookup.get(zk)
+            original_abs = meta.get("abstract", "")
+
+            # Only rerun NFTs if we now have an abstract we didn't before
+            if enriched_abs and not original_abs:
+                abstract = enriched_abs
+            elif enriched_abs:
+                abstract = enriched_abs  # prefer enriched
+            else:
+                abstract = original_abs
+
+            # Skip NFTs that still have no abstract (nothing changed)
+            if not abstract:
+                continue
+
+            rerun_papers.append({
+                "zotero_key": zk,
+                "doi": rec.get("doi", meta.get("doi", "")),
+                "title": meta.get("title", ""),
+                "authors": meta.get("authors", ""),
+                "year": meta.get("year", ""),
+                "journal": meta.get("journal", ""),
+                "abstract": abstract,
+                "original_status": "needs_full_text",
+            })
+
+    if args.limit:
+        rerun_papers = rerun_papers[:args.limit]
+
+    # Report
+    n_errors = sum(1 for p in rerun_papers if p["original_status"] == "error")
+    n_nft = sum(1 for p in rerun_papers if p["original_status"] == "needs_full_text")
+    n_with_abs = sum(1 for p in rerun_papers if p.get("abstract"))
+
+    print(f"\nRerun candidates: {len(rerun_papers)}")
+    print(f"  Errors:          {n_errors}")
+    print(f"  Enriched NFTs:   {n_nft}")
+    print(f"  With abstract:   {n_with_abs}")
+    print(f"  Without abstract: {len(rerun_papers) - n_with_abs}")
+
+    if args.dry_run:
+        print("\n--- DRY RUN --- No API calls made.")
+        print(f"Would process {len(rerun_papers)} papers with {args.model}")
+        est_input = len(rerun_papers) * (2300 + 400)  # system + abstract
+        est_output = len(rerun_papers) * 150  # avg output
+        print(f"Estimated tokens: ~{est_input/1e6:.2f}M input, ~{est_output/1e6:.3f}M output")
+        return
+
+    if args.batch:
+        # Generate Batch API JSONL file (submit separately for 50% savings)
+        batch_requests = prepare_batch_requests(rerun_papers, args.model)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        batch_path = OUTPUT_DIR / f"rerun_batch_{timestamp}.jsonl"
+        with open(batch_path, "w") as f:
+            for req in batch_requests:
+                f.write(json.dumps(req) + "\n")
+        print(f"\nBatch file written to {batch_path}")
+        print(f"  {len(batch_requests)} requests")
+        print(f"\nTo submit:")
+        print(f"  import anthropic")
+        print(f"  client = anthropic.Anthropic()")
+        print(f"  batch = client.messages.batches.create(")
+        print(f'    requests=[json.loads(l) for l in open("{batch_path}")]')
+        print(f"  )")
+        return
+
+    # Standard run (default) — streams through with checkpointing
+    import anthropic
+    if not ANTHROPIC_API_KEY:
+        print("ERROR: ANTHROPIC_API_KEY not set in .env")
+        sys.exit(1)
+
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = OUTPUT_DIR / f"rerun_{timestamp}_raw.json"
+
+    # Resume support: check for existing checkpoint
+    results = []
+    done_keys = set()
+    if args.resume:
+        existing = sorted(OUTPUT_DIR.glob("rerun_*_raw.json"))
+        if existing:
+            output_path = existing[-1]
+            with open(output_path) as f:
+                results = json.load(f)
+            done_keys = {r.get("zotero_key") for r in results if r.get("zotero_key")}
+            print(f"Resuming from {output_path} — {len(done_keys)} already done")
+
+    skipped = 0
+    for i, paper in enumerate(rerun_papers):
+        if paper["zotero_key"] in done_keys:
+            skipped += 1
+            continue
+
+        title_short = paper["title"][:60] if paper["title"] else paper["doi"][:40]
+        print(f"[{i+1 - skipped}/{len(rerun_papers) - len(done_keys)}] {title_short}")
+
+        msg = build_user_message(
+            title=paper["title"],
+            abstract=paper["abstract"],
+            authors=paper["authors"],
+            year=paper["year"],
+            journal=paper["journal"],
+            doi=paper["doi"],
+        )
+        result = call_claude(client, msg, paper["zotero_key"], args.model)
+
+        if "error" in result:
+            print(f"  -> ERROR: {result['error']}")
+        else:
+            dec = result.get("screening_decision", "?")
+            n_rows = len(result.get("rows", []))
+            conf = result.get("screening_confidence", "")
+            print(f"  -> {dec.upper()} ({conf}) -- {n_rows} row(s)")
+
+        results.append(result)
+
+        # Checkpoint after every paper
+        with open(output_path, "w") as f:
+            json.dump(results, f, indent=2)
+
+        time.sleep(PAUSE_BETWEEN)
+
+    # Summary
+    from collections import Counter
+    decisions = Counter()
+    for r in results:
+        if "error" in r:
+            decisions["error"] += 1
+        else:
+            decisions[r.get("screening_decision", "unknown")] += 1
+
+    print(f"\n{'='*50}")
+    print(f"  RERUN COMPLETE")
+    print(f"{'='*50}")
+    print(f"  Total: {len(results)}")
+    for dec, count in decisions.most_common():
+        print(f"    {dec}: {count}")
+    print(f"\n  Output: {output_path}")
+    print(f"\n  Next step: re-run integrate_agent_results.py")
+    print(f"  with --json {output_path} to merge into Excel")
+
+
+if __name__ == "__main__":
+    main()
