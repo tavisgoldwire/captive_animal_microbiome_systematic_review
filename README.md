@@ -2,7 +2,7 @@
 
 An AI-assisted pipeline for large-scale systematic literature screening and data extraction, built for a systematic review of gut microbiome research in captive animals.
 
-Sensitive information was removed and will be added upon publishing
+Sensitive information was removed and will be added upon publishing.
 
 ## Background
 
